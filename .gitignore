@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+results/exp2/*.pt
+results/exp3/*.pt
