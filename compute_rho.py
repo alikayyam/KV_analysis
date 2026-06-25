@@ -131,16 +131,16 @@ def _extract_head(layer, family: str, h: int, d_k: int, d: int
     raise ValueError(f"Unknown family: {family!r}")
 
 
-# ── ρ computation ─────────────────────────────────────────────────────────────
+# ── diagnostics ───────────────────────────────────────────────────────────────
 
-def compute_rho_head(
+def compute_head_diagnostics(
     WK: np.ndarray,
     WV: np.ndarray,
     WO: np.ndarray,
     eps: float = 1e-6,
-) -> float:
+) -> tuple[float, float, float, float]:
     """
-    Compute ρ ∈ [0, 1] for a single attention head.
+    Compute four per-head diagnostics.
 
     Parameters
     ----------
@@ -151,35 +151,52 @@ def compute_rho_head(
 
     Returns
     -------
-    float in [0, 1]:  1.0 if Condition C holds exactly, 0.0 if col(B^T) = {0}
+    (rho, diff_norm, stable_rank_K, M_norm)
+      rho           : Condition-C coverage in [0, 1]
+      diff_norm     : ‖W_V - W_K‖_F  (divergence of V from K)
+      stable_rank_K : ‖W_K‖_F² / ‖W_K‖_op²  (1 = rank-1, d_k = full rank)
+      M_norm        : ‖M‖_F where M = W_O(W_V - W_K)
     """
     diff = WV - WK  # (d_k, d)
 
-    # ‖M‖_F² = tr(W_O^T W_O · diff diff^T) — avoids forming the d×d matrix M
+    # ── diff_norm ──────────────────────────────────────────────────────────────
+    diff_norm = float(np.linalg.norm(diff, "fro"))
+
+    # ── stable rank of W_K ────────────────────────────────────────────────────
+    s_wk = np.linalg.svd(WK, compute_uv=False)
+    wk_fro_sq = float(np.sum(s_wk ** 2))
+    wk_op_sq  = float(s_wk[0] ** 2) if s_wk[0] > 0 else 1.0
+    stable_rank_K = wk_fro_sq / wk_op_sq if wk_op_sq > 0 else 0.0
+
+    # ── ‖M‖_F (avoids forming the d×d matrix M) ───────────────────────────────
     G = WO.T @ WO      # (d_k, d_k)
     H = diff @ diff.T  # (d_k, d_k)
     norm_M_sq = float(np.trace(G @ H))
-    if norm_M_sq < 1e-20:
-        return 1.0  # M ≈ 0: Condition C holds trivially
+    M_norm = float(np.sqrt(max(norm_M_sq, 0.0)))
 
-    # Efficient ONB for col(B^T), B = W_O W_K.
-    # col(B^T) = col(W_K^T W_O^T).
-    # Step 1: thin SVD of W_O^T (d_k × d)
-    # Step 2: thin SVD of W_K^T U_{O,r} (d × r_O) — both O(d · d_k²) not O(d³)
+    # ── ρ ─────────────────────────────────────────────────────────────────────
+    if norm_M_sq < 1e-20:
+        return 1.0, diff_norm, stable_rank_K, M_norm  # M ≈ 0: Condition C trivial
+
     U_O, s_O, _ = np.linalg.svd(WO.T, full_matrices=False)
     if s_O[0] < 1e-20:
-        return 0.0
+        return 0.0, diff_norm, stable_rank_K, M_norm
     U_O_r = U_O[:, s_O > eps * s_O[0]]        # (d_k, r_O)
 
     G_factor = WK.T @ U_O_r                   # (d, r_O)
     U_B, s_B, _ = np.linalg.svd(G_factor, full_matrices=False)
     if s_B[0] < 1e-20:
-        return 0.0
+        return 0.0, diff_norm, stable_rank_K, M_norm
     U_B_r = U_B[:, s_B > eps * s_B[0]]        # (d, r_B)
 
-    # ‖P_{col(B^T)} M^T‖_F² = ‖M U_{B,r}‖_F² = ‖W_O diff U_{B,r}‖_F²
     projected = WO @ (diff @ U_B_r)            # (d, r_B)
-    return float(np.linalg.norm(projected, "fro") ** 2) / norm_M_sq
+    rho = float(np.linalg.norm(projected, "fro") ** 2) / norm_M_sq
+    return rho, diff_norm, stable_rank_K, M_norm
+
+
+def compute_rho_head(WK, WV, WO, eps=1e-6) -> float:
+    """Backward-compatible wrapper — returns only ρ."""
+    return compute_head_diagnostics(WK, WV, WO, eps)[0]
 
 
 # ── model loading and processing ──────────────────────────────────────────────
@@ -199,11 +216,16 @@ def process_model(key: str, spec: ModelSpec, eps: float = 1e-6) -> np.ndarray:
     layers, num_layers, num_heads, d_k, d = _model_shape(model, spec)
     print(f"  {num_layers} layers · {num_heads} heads · d = {d} · d_k = {d_k}  [{spec.family}]")
 
-    rho = np.zeros((num_layers, num_heads), dtype=np.float64)
+    rho           = np.zeros((num_layers, num_heads), dtype=np.float64)
+    diff_norm     = np.zeros((num_layers, num_heads), dtype=np.float64)
+    stable_rank_K = np.zeros((num_layers, num_heads), dtype=np.float64)
+    M_norm        = np.zeros((num_layers, num_heads), dtype=np.float64)
+
     for l, layer in enumerate(layers):
         for h in range(num_heads):
             WK, WV, WO = _extract_head(layer, spec.family, h, d_k, d)
-            rho[l, h] = compute_rho_head(WK, WV, WO, eps=eps)
+            rho[l, h], diff_norm[l, h], stable_rank_K[l, h], M_norm[l, h] = \
+                compute_head_diagnostics(WK, WV, WO, eps=eps)
 
         if (l + 1) % 6 == 0 or (l + 1) == num_layers:
             print(f"  layer {l+1:3d}/{num_layers}  running mean ρ = {rho[:l+1].mean():.4f}")
@@ -215,7 +237,7 @@ def process_model(key: str, spec: ModelSpec, eps: float = 1e-6) -> np.ndarray:
     m, med, mn = rho.mean(), np.median(rho), rho.min()
     pct = (rho >= 0.95).mean() * 100
     print(f"  ── {key}: mean={m:.4f}  median={med:.4f}  min={mn:.4f}  pct≥0.95={pct:.1f}%")
-    return rho
+    return rho, diff_norm, stable_rank_K, M_norm
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -244,7 +266,11 @@ def main() -> None:
         print(f"Loaded existing results for: {list(results.keys())}")
 
     for key in args.models:
-        results[key] = process_model(key, MODELS[key], eps=args.eps)
+        rho, diff_norm, stable_rank_K, M_norm = process_model(key, MODELS[key], eps=args.eps)
+        results[key]                          = rho
+        results[f"{key}_diff_norm"]           = diff_norm
+        results[f"{key}_stable_rank_K"]       = stable_rank_K
+        results[f"{key}_M_norm"]              = M_norm
 
     np.savez(args.out, **results)
     print(f"\nSaved → {args.out}  (keys: {list(results.keys())})")

@@ -51,8 +51,9 @@ def _expand_ffn(layer: nn.Module, extra: int) -> None:
     has_b1 = old1.bias is not None
     has_b2 = old2.bias is not None
 
-    new1 = nn.Linear(d,     h_new, bias=has_b1)
-    new2 = nn.Linear(h_new, d,     bias=has_b2)
+    dtype = old1.weight.dtype
+    new1 = nn.Linear(d,     h_new, bias=has_b1).to(dtype)
+    new2 = nn.Linear(h_new, d,     bias=has_b2).to(dtype)
 
     with torch.no_grad():
         new1.weight[:h_old] = old1.weight
@@ -77,8 +78,9 @@ def build_tied_model(model_id: str) -> nn.Module:
       · freeze all attention parameters
       · expand each FFN by 2d neurons (zero-init)
     """
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float32, low_cpu_mem_usage=True
+        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True
     )
     model.eval()
     d = model.config.hidden_size
@@ -312,8 +314,9 @@ def main() -> None:
 
     # ── Step 1: untied baseline ──
     print("\n── Step 1: Untied model ──────────────────────────────")
+    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     untied = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float32, low_cpu_mem_usage=True
+        args.model, torch_dtype=torch_dtype, low_cpu_mem_usage=True
     )
     outs_untied = get_layer_outputs(untied, eval_ids, device)
     ppl_untied  = compute_perplexity(untied, test_loader, device)
